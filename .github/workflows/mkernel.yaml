@@ -108,7 +108,7 @@ jobs:
       contents: write
 
     steps:
-      # 0. 安全初始化环境变量（彻底杜绝表达式错误）
+      # 0. 初始化并校验构建环境变量
       - name: Initialize Workflow Environment
         run: |
           LABEL="${{ inputs.kernel_label }}"
@@ -130,6 +130,18 @@ jobs:
 
       - name: Display Build Reason
         run: |
+          echo "=== 触发本次编译的原因 ==="
+          echo "${{ needs.check.outputs.build_reason }}"
+
+      # 1. 清理 Runner 磁盘空间
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
 
       # 2. 检出源码
       - name: Checkout Source (bakasu branch)
@@ -182,7 +194,7 @@ jobs:
             exit 1
           fi
 
-      # 5. 集成 SuSFS 内核端代码与补丁
+      # 5. 集成 SuSFS 内核端代码与补丁 (修复 current_uid 及头文件顺序)
       - name: Setup & Patch SuSFS Kernel Side
         if: env.ENABLE_SUSFS == 'true'
         run: |
@@ -214,15 +226,41 @@ jobs:
             }
           fi
 
-          for target in fs/exec.c fs/open.c fs/stat.c fs/namei.c fs/namespace.c fs/proc_namespace.c; do
-            if [ -f "$target" ]; then
-              if grep -q "susfs_" "$target" && ! grep -q "linux/susfs.h" "$target"; then
-                echo "正在为 $target 补全 #include <linux/susfs.h>..."
-                sed -i '1i #if defined(CONFIG_KSU_SUSFS)\n#include <linux/susfs.h>\n#endif' "$target"
-              fi
+          # 1. 确保 include/linux/susfs_def.h 包含 linux/cred.h (彻底解决 current_uid 未定义)
+          if [ -f "include/linux/susfs_def.h" ]; then
+            if ! grep -q "linux/cred.h" include/linux/susfs_def.h; then
+              echo "为 include/linux/susfs_def.h 补全 #include <linux/cred.h>..."
+              sed -i '1i #include <linux/cred.h>' include/linux/susfs_def.h
             fi
-          done
+          fi
 
+          # 2. 精准定位目标文件的【最后一个 #include 之后】追加头文件，严禁插入在第一行
+          python3 -c '
+          import os
+
+          targets = ["fs/exec.c", "fs/open.c", "fs/stat.c", "fs/namei.c", "fs/namespace.c", "fs/proc_namespace.c"]
+          for target in targets:
+              if not os.path.exists(target):
+                  continue
+              with open(target, "r") as f:
+                  content = f.read()
+              if "susfs_" in content and "linux/susfs.h" not in content:
+                  print(f"正在为 {target} 规范追加 #include <linux/susfs.h>...")
+                  lines = content.splitlines(keepends=True)
+                  last_inc = -1
+                  for i, line in enumerate(lines):
+                      if line.strip().startswith("#include"):
+                          last_inc = i
+                  inject = "#if defined(CONFIG_KSU_SUSFS)\n#include <linux/susfs.h>\n#endif\n"
+                  if last_inc != -1:
+                      lines.insert(last_inc + 1, inject)
+                  else:
+                      lines.insert(0, inject)
+                  with open(target, "w") as f:
+                      f.writelines(lines)
+          '
+
+          # 3. 补充 susfs_is_current_proc_no_su 原型与函数体
           if ! grep -q "susfs_is_current_proc_no_su" include/linux/susfs.h; then
             echo "在 include/linux/susfs.h 中补充声明..."
             printf '\n#if defined(CONFIG_KSU_SUSFS)\nextern bool susfs_is_current_proc_no_su(void);\n#endif\n' >> include/linux/susfs.h
@@ -233,6 +271,7 @@ jobs:
             printf '\nbool susfs_is_current_proc_no_su(void) {\n    return false;\n}\n' >> fs/susfs.c
           fi
 
+          # 4. 注入 ksu_handle_setresuid 钩子
           if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
             echo "向 kernel/sys.c 注入 ksu_handle_setresuid 钩子..."
             sed -i '1i #if defined(CONFIG_KSU) || defined(CONFIG_KSU_SUSFS)\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif' kernel/sys.c
