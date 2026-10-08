@@ -134,7 +134,6 @@ jobs:
           elif [ -d "drivers/kernelsu/.git" ]; then
             BAKASU_VER=$(cd drivers/kernelsu && (git describe --tags --always 2>/dev/null || git rev-parse --short HEAD))
           fi
-          # 读取驱动内部版本定义
           if [ -f "drivers/kernelsu/kernel/Makefile" ]; then
             KSU_NUM=$(grep -E 'KSU_VERSION=' drivers/kernelsu/kernel/Makefile | head -n 1 | sed -E 's/.*KSU_VERSION=([0-9a-zA-Z._-]+).*/\1/' || true)
             [ -n "$KSU_NUM" ] && BAKASU_VER="${BAKASU_VER} (Build:${KSU_NUM})"
@@ -165,7 +164,6 @@ jobs:
             HYBRID_MOUNT_VER="v1.0 (OverlayFS + VFS Inline)"
           fi
 
-          # 导出至环境变量
           echo "BAKASU_VER=${BAKASU_VER}" >> $GITHUB_ENV
           echo "SUSFS_VER=${SUSFS_VER}" >> $GITHUB_ENV
           echo "HYBRID_MOUNT_VER=${HYBRID_MOUNT_VER}" >> $GITHUB_ENV
@@ -174,22 +172,29 @@ jobs:
           echo "SuSFS 版本: ${SUSFS_VER}"
           echo "Hybrid Mount 版本: ${HYBRID_MOUNT_VER}"
 
-      # 7. 持久化缓存：Google AOSP Clang 工具链
-      - name: Cache AOSP Clang Toolchain
-        id: cache-clang
-        uses: actions/cache@v4
+      # 7. Clang 工具链即时缓存机制（解决即使报错也能存下缓存、下次秒恢复）
+      - name: Restore AOSP Clang Cache
+        id: cache-clang-restore
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/clang
           key: aosp-clang-r522817
 
       - name: Setup AOSP Clang Toolchain
-        if: steps.cache-clang.outputs.cache-hit != 'true'
+        if: steps.cache-clang-restore.outputs.cache-hit != 'true'
         run: |
           mkdir -p ${{ github.workspace }}/clang
-          echo "从 AOSP 下载 clang-r522817..."
+          echo "未命中本地工具链缓存，从 AOSP 下载 clang-r522817..."
           curl -LO "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
           tar -C ${{ github.workspace }}/clang/ -zxf clang-r522817.tar.gz
           rm -f clang-r522817.tar.gz
+
+      - name: Save AOSP Clang Cache Immediately
+        if: steps.cache-clang-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/clang
+          key: aosp-clang-r522817
 
       - name: Register Toolchain to PATH
         run: |
@@ -335,6 +340,6 @@ jobs:
 
             ### 📥 刷入指引
             1. 请确保设备已解锁 Bootloader。
-            2. 使用支持 Android 16 的 内核管理器刷入 zip 刷机包。
+            2. 使用支持 Android 16 的内核管理器直接刷入 zip 刷机包。
             3. 重启设备并配合最新的 BakaSU / KernelSU 管理器 App 使用。
           files: ${{ env.ZIP_NAME }}
