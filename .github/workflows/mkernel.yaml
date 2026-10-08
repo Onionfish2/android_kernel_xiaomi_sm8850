@@ -49,7 +49,7 @@ jobs:
           ref: bakasu
           fetch-depth: 1
 
-      - name: Check Updates & 7-Day Cycle
+      - name: Check Updates & 3-Day Cycle
         id: check-update
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -83,14 +83,14 @@ jobs:
 
               echo "距离上一次发布已有: ${DAYS_DIFF} 天"
 
-              if [ "$DAYS_DIFF" -ge 7 ]; then
+              if [ "$DAYS_DIFF" -ge 3 ]; then
                 NEED_BUILD="true"
-                REASON="已达到 7 天定期编译周期 (距上次发布已有 ${DAYS_DIFF} 天)"
+                REASON="已达到 3 天定期编译周期 (距上次发布已有 ${DAYS_DIFF} 天)"
               elif ! echo "$LAST_RELEASE_BODY" \vert{} grep -Fq "$CURRENT_HASH"; then
                 NEED_BUILD="true"
                 REASON="检测到上游组件变动 (BakaSU / SuSFS / 内核源码有新提交)"
               else
-                echo "上游均无新更新，且发布周期未满 7 天，跳过本次构建。"
+                echo "上游均无新更新，且发布周期未满 3 天，跳过本次构建。"
               fi
             fi
           fi
