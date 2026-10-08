@@ -194,7 +194,7 @@ jobs:
             exit 1
           fi
 
-      # 5. 集成 SuSFS 内核代码与注入强保底补丁
+      # 5. 集成 SuSFS 内核代码（纯净修复，彻底规避重复定义）
       - name: Setup & Patch SuSFS Kernel Side
         if: env.ENABLE_SUSFS == 'true'
         run: |
@@ -226,37 +226,41 @@ jobs:
             }
           fi
 
-          # ----------------- 核心修复 1: 保证 susfs 头文件完全自包含 -----------------
+          # 1. 确保 include/linux/susfs_def.h 引入 cred.h (解决 current_uid 未定义)
           if [ -f "include/linux/susfs_def.h" ]; then
             if ! grep -q "linux/cred.h" include/linux/susfs_def.h; then
               echo "修复 susfs_def.h: 注入 cred.h 依赖..."
               sed -i '1i #include <linux/cred.h>' include/linux/susfs_def.h
             fi
           fi
-          if [ -f "include/linux/susfs.h" ]; then
-            if ! grep -q "susfs_is_current_proc_no_su" include/linux/susfs.h; then
-              echo "在 include/linux/susfs.h 无条件显式声明符号..."
-              printf '\nextern bool susfs_is_current_proc_no_su(void);\n' >> include/linux/susfs.h
-            fi
-          fi
 
-          # ----------------- 核心修复 2: 彻底根治 fs/exec.c 未声明报错 -----------------
-          # 在 fs/exec.c 最顶端（第 1 行）直接注入包含 weak 函数的原型与默认实现
-          if [ -f "fs/exec.c" ]; then
-            if ! grep -q "susfs_is_current_proc_no_su" fs/exec.c; then
-              echo "向 fs/exec.c 顶部注入 susfs_is_current_proc_no_su 弱符号实现..."
-              sed -i '1i #include <linux/types.h>\nextern bool susfs_is_current_proc_no_su(void);\n__attribute__((weak)) bool susfs_is_current_proc_no_su(void) { return false; }' fs/exec.c
-            fi
-          fi
+          # 2. 确保 fs/exec.c 等 VFS 核心文件规范引入 susfs.h
+          python3 -c '
+          import os
 
-          # ----------------- 核心修复 3: 补充 fs/susfs.c 弱符号实现 -----------------
-          if [ -f "fs/susfs.c" ]; then
-            if ! grep -q "susfs_is_current_proc_no_su" fs/susfs.c; then
-              printf '\n__attribute__((weak)) bool susfs_is_current_proc_no_su(void) {\n    return false;\n}\n' >> fs/susfs.c
-            fi
-          fi
+          targets = ["fs/exec.c", "fs/open.c", "fs/stat.c", "fs/namei.c", "fs/namespace.c", "fs/proc_namespace.c"]
+          for target in targets:
+              if not os.path.exists(target):
+                  continue
+              with open(target, "r") as f:
+                  content = f.read()
+              if "susfs_" in content and "linux/susfs.h" not in content:
+                  print(f"正在为 {target} 规范追加 #include <linux/susfs.h>...")
+                  lines = content.splitlines(keepends=True)
+                  last_inc = -1
+                  for i, line in enumerate(lines):
+                      if line.strip().startswith("#include"):
+                          last_inc = i
+                  inject = "\n#if defined(CONFIG_KSU_SUSFS)\n#include <linux/susfs.h>\n#endif\n"
+                  if last_inc != -1:
+                      lines.insert(last_inc + 1, inject)
+                  else:
+                      lines.insert(0, inject)
+                  with open(target, "w") as f:
+                      f.writelines(lines)
+          '
 
-          # ----------------- 核心修复 4: 注入 ksu_handle_setresuid 钩子 -----------------
+          # 3. 注入 ksu_handle_setresuid 钩子
           if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
             echo "向 kernel/sys.c 注入 ksu_handle_setresuid 钩子..."
             sed -i '1i #if defined(CONFIG_KSU) || defined(CONFIG_KSU_SUSFS)\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif' kernel/sys.c
@@ -323,7 +327,6 @@ jobs:
           tar -C ${{ github.workspace }}/clang/ -zxf clang-r522817.tar.gz
           rm -f clang-r522817.tar.gz
 
-      # 即时保存 Clang 缓存，即便后续构建中断也不会丢失
       - name: Save AOSP Clang Cache Immediately
         if: steps.cache-clang-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -384,7 +387,7 @@ jobs:
           # BakaSU 基础项
           scripts/config --file ${OUT_DIR}/.config -e KSU
 
-          # 激活完整 SuSFS 特性宏链（特别是关键的 KSU_SUSFS_SUS_SU）
+          # 激活完整 SuSFS 特性宏链（包括 KSU_SUSFS_SUS_SU）
           if [ "$ENABLE_SUSFS" = "true" ]; then
             echo "正在激活 SuSFS 全套功能宏..."
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS
@@ -404,7 +407,7 @@ jobs:
 
           scripts/config --file ${OUT_DIR}/.config -d DEBUG_INFO_BTF
 
-      # 10. 执行内核镜像编译（携带容错 flags）
+      # 10. 执行内核镜像编译
       - name: Build Kernel Image
         run: |
           export ARCH=arm64
@@ -418,7 +421,7 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-w -Wno-error=implicit-function-declaration" \
+            KCFLAGS="-w" \
             Image 2>&1 | tee build.log
 
           if [ ! -f "${OUT_DIR}/arch/arm64/boot/Image" ]; then
@@ -428,7 +431,7 @@ jobs:
             exit 1
           fi
 
-      # 11. 即使失败也强制保存本次 ccache 缓存，后续再次编译可秒级跳过
+      # 11. 即使失败也强制保存本次 ccache 缓存
       - name: Save ccache Data Even on Failure
         if: always()
         uses: actions/cache/save@v4
