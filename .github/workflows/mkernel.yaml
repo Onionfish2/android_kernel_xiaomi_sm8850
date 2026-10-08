@@ -164,7 +164,7 @@ jobs:
             exit 1
           fi
 
-      # 5. 集成 SuSFS 内核端代码与补丁（包含针对 fs/exec.c 缺失头文件的自动修复）
+      # 5. 集成 SuSFS 内核端代码与补丁 (使用纯 printf 彻底消除 YAML 语法红线)
       - name: Setup & Patch SuSFS Kernel Side
         if: ${{ inputs.enable_susfs != false }}
         run: |
@@ -196,34 +196,29 @@ jobs:
             }
           fi
 
-          # 修复问题 1：自动向调用了 susfs_ 但缺失头文件的源码注入 #include <linux/susfs.h>
+          # 自动补全缺失的 #include <linux/susfs.h>
           for target in fs/exec.c fs/open.c fs/stat.c fs/namei.c fs/namespace.c fs/proc_namespace.c; do
             if [ -f "$target" ]; then
               if grep -q "susfs_" "$target" && ! grep -q "linux/susfs.h" "$target"; then
-                echo "正在为 $target 自动补全 #include <linux/susfs.h>..."
+                echo "正在为 $target 补全 #include <linux/susfs.h>..."
                 sed -i '1i #if defined(CONFIG_KSU_SUSFS)\n#include <linux/susfs.h>\n#endif' "$target"
               fi
             fi
           done
 
-          # 修复问题 2：确保 include/linux/susfs.h 中包含 susfs_is_current_proc_no_su 声明
+          # 在 include/linux/susfs.h 声明函数原型
           if ! grep -q "susfs_is_current_proc_no_su" include/linux/susfs.h; then
-            echo "在 include/linux/susfs.h 中补充 susfs_is_current_proc_no_su 声明..."
-            echo -e "\n#if defined(CONFIG_KSU_SUSFS)\nextern bool susfs_is_current_proc_no_su(void);\n#endif" >> include/linux/susfs.h
+            echo "在 include/linux/susfs.h 中补充声明..."
+            printf '\n#if defined(CONFIG_KSU_SUSFS)\nextern bool susfs_is_current_proc_no_su(void);\n#endif\n' >> include/linux/susfs.h
           fi
 
-          # 修复问题 3：确保 fs/susfs.c 中存在该函数的实现体，防止链接阶段报未定义符号
+          # 使用 printf 单行追加函数体，避免 Heredoc 导致的缩进错误
           if ! grep -q "susfs_is_current_proc_no_su" fs/susfs.c; then
-            echo "在 fs/susfs.c 中补充默认函数体..."
-            cat << 'EOF' >> fs/susfs.c
-
-bool susfs_is_current_proc_no_su(void) {
-    return false;
-}
-EOF
+            echo "在 fs/susfs.c 中补充默认函数实现..."
+            printf '\nbool susfs_is_current_proc_no_su(void) {\n    return false;\n}\n' >> fs/susfs.c
           fi
 
-          # 修复问题 4：向 kernel/sys.c 注入 ksu_handle_setresuid 钩子
+          # 向 kernel/sys.c 注入 ksu_handle_setresuid 钩子
           if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
             echo "向 kernel/sys.c 注入 ksu_handle_setresuid 钩子..."
             sed -i '1i #if defined(CONFIG_KSU) || defined(CONFIG_KSU_SUSFS)\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif' kernel/sys.c
