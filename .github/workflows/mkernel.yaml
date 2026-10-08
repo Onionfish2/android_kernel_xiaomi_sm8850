@@ -1,0 +1,167 @@
+name: Build Xiaomi SM8850 BakaSU Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_label:
+        description: '内核自定义标识 (影响 uname -r 后缀与 Zip 命名)'
+        required: true
+        type: string
+        default: 'Kokuban-SilverWolf'
+      enable_susfs:
+        description: '启用 SuSFS 深度隐藏特性'
+        required: true
+        type: boolean
+        default: true
+      create_release:
+        description: '编译完成后自动创建 GitHub Release'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build Kernel (bakasu branch)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h
+
+      - name: Checkout Source (bakasu branch)
+        uses: actions/checkout@v4
+        with:
+          ref: bakasu
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            libncurses-dev dwarves binutils-aarch64-linux-gnu \
+            python3 python-is-python3 git curl zip ccache lld llvm
+
+      - name: Setup AOSP Clang Toolchain (Android 16 / Linux 6.12)
+        run: |
+          mkdir -p clang
+          echo "正在下载 Google 官方 AOSP Clang (clang-r522817)..."
+          curl -LO "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
+          tar -C clang/ -zxf clang-r522817.tar.gz
+          rm -f clang-r522817.tar.gz
+          echo "${GITHUB_WORKSPACE}/clang/bin" >> $GITHUB_PATH
+
+      - name: Configure Kernel & Apply Features
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="${GITHUB_WORKSPACE}/clang/bin:$PATH"
+
+          OUT_DIR=out
+          mkdir -p ${OUT_DIR}
+
+          # 1. 生成基础 defconfig
+          make -j$(nproc --all) O=${OUT_DIR} \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            gki_defconfig
+
+          # 2. 修改 LocalVersion (内核标签注入)
+          CUSTOM_LABEL="${{ inputs.kernel_label }}"
+          echo "设置内核 LocalVersion 标识为: -${CUSTOM_LABEL}"
+          scripts/config --file ${OUT_DIR}/.config --set-str LOCALVERSION "-${CUSTOM_LABEL}"
+
+          # 3. 启用 Hybrid Mount 核心依赖 (OverlayFS 等)
+          scripts/config --file ${OUT_DIR}/.config -e OVERLAY_FS
+          scripts/config --file ${OUT_DIR}/.config -e SQUASHFS
+          scripts/config --file ${OUT_DIR}/.config -e TMPFS_XATTR
+
+          # 4. 配置 BakaSU / SuSFS
+          scripts/config --file ${OUT_DIR}/.config -e KSU
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            echo "正在启用 SuSFS 扩展选项..."
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_MOUNT
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_ENABLE_HASH_MODE
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_TRY_UMOUNT
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SPOOF_UNAME
+          fi
+
+          # 5. 避免编译环境 pahole 与 BTF 冲突
+          scripts/config --file ${OUT_DIR}/.config -d DEBUG_INFO_BTF
+
+      - name: Build Kernel Image
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="${GITHUB_WORKSPACE}/clang/bin:$PATH"
+
+          OUT_DIR=out
+          make -j$(nproc --all) O=${OUT_DIR} \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image
+
+          if [ ! -f "${OUT_DIR}/arch/arm64/boot/Image" ]; then
+            echo "::error::未检测到编译生成的 Image 文件，请检查编译日志！"
+            exit 1
+          fi
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1 AnyKernel3
+          rm -rf AnyKernel3/.git*
+
+          # 配置针对 GKI 设备的兼容性
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+
+          # 拷贝编译好的 Image 进刷机包根目录
+          cp out/arch/arm64/boot/Image AnyKernel3/Image
+
+          BUILD_DATE=$(date +%Y%m%d_%H%M%S)
+          CUSTOM_LABEL="${{ inputs.kernel_label }}"
+          ZIP_NAME="Kernel-SM8850-${CUSTOM_LABEL}-${BUILD_DATE}.zip"
+
+          cd AnyKernel3
+          zip -r9 "../${ZIP_NAME}" * -x .git README.md *placeholder
+          cd ..
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+
+      - name: Publish Release
+        if: ${{ inputs.create_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.kernel_label }}-${{ env.BUILD_DATE }}
+          name: Xiaomi SM8850 BakaSU (${{ inputs.kernel_label }}) -${{ env.BUILD_DATE }}
+          body: |
+            ### 构建规格说明
+            - **源码分支**: `bakasu`
+            - **内核基线**: Linux 6.12 GKI (Android 16)
+            - **目标芯片**: Qualcomm SM8850
+            - **集成特性**: BakaSU, SuSFS 模块隐藏, Hybrid Mount 支持
+            - **内核版本标识**: `${{ inputs.kernel_label }}`
+          files: ${{ env.ZIP_NAME }}
