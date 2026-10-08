@@ -180,4 +180,67 @@ jobs:
         run: |
           export ARCH=arm64
           export SUBARCH=arm64
-          export PATH="${{
+          export PATH="${{ github.workspace }}/clang/bin:$PATH"
+
+          OUT_DIR=out
+          make -j$(nproc --all) O=${OUT_DIR} \
+            ARCH=arm64 \
+            CC="ccache clang" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image
+
+          if [ ! -f "${OUT_DIR}/arch/arm64/boot/Image" ]; then
+            echo "::error::编译失败，未在产物目录找到 Image 文件！"
+            exit 1
+          fi
+
+      # 9. 输出本轮 ccache 命中统计
+      - name: Display ccache Statistics
+        run: |
+          echo "=== ccache 构建统计 ==="
+          ccache -s
+
+      # 10. 使用 AnyKernel3 打包为刷机包 (Zip)
+      - name: Package with AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1 AnyKernel3
+          rm -rf AnyKernel3/.git*
+
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
+          cp out/arch/arm64/boot/Image AnyKernel3/Image
+
+          BUILD_DATE=$(date +%Y%m%d_%H%M%S)
+          CUSTOM_LABEL="${{ inputs.kernel_label }}"
+          ZIP_NAME="Kernel-SM8850-${CUSTOM_LABEL}-${BUILD_DATE}.zip"
+
+          cd AnyKernel3
+          zip -r9 "../${ZIP_NAME}" * -x .git README.md *placeholder
+          cd ..
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_ENV
+
+      # 11. 上传 Artifact 构建产物
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+
+      # 12. 自动发布到 GitHub Releases
+      - name: Publish Release
+        if: ${{ inputs.create_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.kernel_label }}-${{ env.BUILD_DATE }}
+          name: Xiaomi SM8850 BakaSU (${{ inputs.kernel_label }}) -${{ env.BUILD_DATE }}
+          body: |
+            ### 构建信息
+            - **源码分支**: `bakasu`
+            - **架构平台**: Qualcomm SM8850 (Xiaomi 17 系列)
+            - **内核基线**: Linux 6.12 GKI (Android 16)
+            - **集成特性**: BakaSU, SuSFS 模块隐藏, Hybrid Mount
+            - **内核标签**: `${{ inputs.kernel_label }}`
+          files: ${{ env.ZIP_NAME }}
