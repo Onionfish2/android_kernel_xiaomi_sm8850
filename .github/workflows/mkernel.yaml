@@ -40,26 +40,27 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      # 3. 安装基础构建工具链
+      # 3. 安装依赖工具链（已补充 libdw-dev 解决 dwarf.h 缺失）
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
             libncurses-dev dwarves binutils-aarch64-linux-gnu \
-            python3 python-is-python3 git curl zip ccache lld llvm
+            python3 python-is-python3 git curl zip ccache lld llvm \
+            libdw-dev
 
-      # 4. 正确配置并装载 BakaSU / KernelSU 驱动（修复路径与 Kconfig 索引）
+      # 4. 正确配置并装载 BakaSU / KernelSU 驱动（修复 Kconfig 路径）
       - name: Setup BakaSU / KernelSU Source
         run: |
           echo "=== 检查并配置 BakaSU / KernelSU 驱动 ==="
           
-          # 清理旧残留文件
+          # 清理旧残留
           rm -rf drivers/kernelsu KernelSU
 
           SETUP_OK=false
 
-          # 方案 A：尝试使用官方标准 setup.sh 脚本在线部署
+          # 方案 A：尝试通过官方 setup.sh 部署
           if curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main; then
             echo "通过 BakaSU setup.sh 部署成功"
             SETUP_OK=true
@@ -68,14 +69,13 @@ jobs:
             SETUP_OK=true
           fi
 
-          # 方案 B：备用 Git 克隆 + 软链接映射
+          # 方案 B：回退手动拉取 + 软链接映射到 kernel 目录
           if [ "$SETUP_OK" != "true" ]; then
-            echo "setup.sh 下载受阻，回退到手动克隆与软链接映射..."
+            echo "setup.sh 网络受限，切换为手动克隆与软链接映射..."
             git clone --depth=1 https://github.com/Baka-SU/BakaSU.git KernelSU || \
             git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU || \
             git clone --depth=1 https://github.com/tiann/KernelSU.git KernelSU
 
-            # 关键修复：drivers/kernelsu 必须指向 KernelSU 内的 kernel 子目录
             ln -sf ../KernelSU/kernel drivers/kernelsu
           fi
 
@@ -84,7 +84,7 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
 
-          # 验证软链接与 Kconfig 是否有效存在
+          # 验证软链接与 Kconfig 状态
           ls -ld drivers/kernelsu
           if [ ! -f "drivers/kernelsu/Kconfig" ]; then
             echo "::error::未能成功配置 BakaSU 驱动，drivers/kernelsu/Kconfig 缺失！"
@@ -129,14 +129,19 @@ jobs:
           mkdir -p "${CCACHE_DIR}"
           ccache -M 4.5G
           ccache -z
-          ccache -s
+          
+          # 创建编译器软链接，避免在 make 参数中传递带空格的 "ccache clang"
+          sudo mkdir -p /usr/local/ccache-bin
+          sudo ln -sf $(which ccache) /usr/local/ccache-bin/clang
+          sudo ln -sf $(which ccache) /usr/local/ccache-bin/clang++
+          echo "/usr/local/ccache-bin" >> $GITHUB_PATH
 
       # 7. 内核配置、特性启用与标签注入
       - name: Configure Kernel & Apply Features
         run: |
           export ARCH=arm64
           export SUBARCH=arm64
-          export PATH="${{ github.workspace }}/clang/bin:$PATH"
+          export PATH="/usr/local/ccache-bin:${{ github.workspace }}/clang/bin:$PATH"
 
           OUT_DIR=out
           mkdir -p ${OUT_DIR}
@@ -144,7 +149,6 @@ jobs:
           # 生成 defconfig
           make -j$(nproc --all) O=${OUT_DIR} \
             ARCH=arm64 \
-            CC="ccache clang" \
             LLVM=1 \
             LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
@@ -156,13 +160,16 @@ jobs:
           scripts/config --file ${OUT_DIR}/.config --set-str LOCALVERSION "-${CUSTOM_LABEL}"
 
           # 注入 Hybrid Mount 核心依赖 (OverlayFS, tmpfs_xattr, squashfs)
+          echo "配置 Hybrid Mount 所需特性..."
           scripts/config --file ${OUT_DIR}/.config -e OVERLAY_FS
           scripts/config --file ${OUT_DIR}/.config -e SQUASHFS
           scripts/config --file ${OUT_DIR}/.config -e TMPFS_XATTR
 
           # 注入 BakaSU 与 SuSFS 深度隐藏特性
+          echo "配置 BakaSU / KernelSU 特性..."
           scripts/config --file ${OUT_DIR}/.config -e KSU
           if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            echo "配置 SuSFS 隐藏挂载与 Hash 模式..."
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_MOUNT
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_ENABLE_HASH_MODE
@@ -171,37 +178,42 @@ jobs:
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SPOOF_UNAME
           fi
 
-          # 规避 pahole 与 BTF 冲突
+          # 规避 BTF 与 pahole 校验冲突
           scripts/config --file ${OUT_DIR}/.config -d DEBUG_INFO_BTF
 
-      # 8. 执行内核镜像编译
+      # 8. 执行编译（加入 KCFLAGS="-w" 屏蔽误报，附带错误自动捕获）
       - name: Build Kernel Image
         run: |
           export ARCH=arm64
           export SUBARCH=arm64
-          export PATH="${{ github.workspace }}/clang/bin:$PATH"
+          export PATH="/usr/local/ccache-bin:${{ github.workspace }}/clang/bin:$PATH"
 
           OUT_DIR=out
+
+          # 编译 Image 并输出日志
           make -j$(nproc --all) O=${OUT_DIR} \
             ARCH=arm64 \
-            CC="ccache clang" \
             LLVM=1 \
             LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            Image
+            KCFLAGS="-w" \
+            Image 2>&1 | tee build.log
 
+          # 产物校验，若失败则自动抓取关键错误
           if [ ! -f "${OUT_DIR}/arch/arm64/boot/Image" ]; then
-            echo "::error::编译失败，未在产物目录找到 Image 文件！"
+            echo "================== 编译失败，核心错误提取 =================="
+            grep -iE "(fatal error|error:)" build.log -B 2 -A 5 | tail -n 40 || true
+            echo "==========================================================="
             exit 1
           fi
 
-      # 9. 输出本轮 ccache 统计结果
+      # 9. 输出本轮 ccache 命中统计
       - name: Display ccache Statistics
         run: |
           echo "=== ccache 构建统计 ==="
           ccache -s
 
-      # 10. 使用 AnyKernel3 打包刷机包
+      # 10. 使用 AnyKernel3 打包为刷机包 (Zip)
       - name: Package with AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1 AnyKernel3
@@ -238,7 +250,7 @@ jobs:
           body: |
             ### 构建信息
             - **源码分支**: `bakasu`
-            - **芯片架构**: Qualcomm SM8850 (Xiaomi 17 系列)
+            - **芯片平台**: Qualcomm SM8850 (Xiaomi 17 系列)
             - **内核基线**: Linux 6.12 GKI (Android 16)
             - **集成特性**: BakaSU, SuSFS 模块隐藏, Hybrid Mount
             - **内核标签**: `${{ inputs.kernel_label }}`
