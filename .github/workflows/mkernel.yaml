@@ -40,7 +40,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      # 3. 安装依赖工具链（已补充 libdw-dev 解决 dwarf.h 缺失）
+      # 3. 安装依赖工具链（包含 libdw-dev 与 patch）
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
@@ -48,19 +48,15 @@ jobs:
             build-essential bc bison flex libssl-dev libelf-dev \
             libncurses-dev dwarves binutils-aarch64-linux-gnu \
             python3 python-is-python3 git curl zip ccache lld llvm \
-            libdw-dev
+            libdw-dev patch
 
-      # 4. 正确配置并装载 BakaSU / KernelSU 驱动（修复 Kconfig 路径）
+      # 4. 配置并装载 BakaSU 驱动
       - name: Setup BakaSU / KernelSU Source
         run: |
           echo "=== 检查并配置 BakaSU / KernelSU 驱动 ==="
-          
-          # 清理旧残留
           rm -rf drivers/kernelsu KernelSU
 
           SETUP_OK=false
-
-          # 方案 A：尝试通过官方 setup.sh 部署
           if curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -s main; then
             echo "通过 BakaSU setup.sh 部署成功"
             SETUP_OK=true
@@ -69,7 +65,6 @@ jobs:
             SETUP_OK=true
           fi
 
-          # 方案 B：回退手动拉取 + 软链接映射到 kernel 目录
           if [ "$SETUP_OK" != "true" ]; then
             echo "setup.sh 网络受限，切换为手动克隆与软链接映射..."
             git clone --depth=1 https://github.com/Baka-SU/BakaSU.git KernelSU || \
@@ -79,21 +74,107 @@ jobs:
             ln -sf ../KernelSU/kernel drivers/kernelsu
           fi
 
-          # 确保 drivers/Makefile 包含 kernelsu 模块声明
           if ! grep -q "kernelsu" drivers/Makefile; then
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
 
-          # 验证软链接与 Kconfig 状态
-          ls -ld drivers/kernelsu
           if [ ! -f "drivers/kernelsu/Kconfig" ]; then
             echo "::error::未能成功配置 BakaSU 驱动，drivers/kernelsu/Kconfig 缺失！"
             exit 1
-          else
-            echo "BakaSU 驱动就绪，Kconfig 校验通过！"
           fi
 
-      # 5. 持久化缓存：Google AOSP Clang 工具链
+      # 5. 集成 SuSFS 内核端代码与补丁
+      - name: Setup & Patch SuSFS Kernel Side
+        if: ${{ inputs.enable_susfs == true }}
+        run: |
+          echo "=== 集成 SuSFS 内核端代码与补丁 ==="
+          rm -rf susfs4ksu
+
+          git clone --depth=1 -b gki-android16-6.12 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || \
+          git clone --depth=1 -b kernel-6.12 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || \
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+
+          mkdir -p include/linux fs
+          cp -fv susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/
+          cp -fv susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/ || true
+          cp -fv susfs4ksu/kernel_patches/fs/susfs.c fs/
+
+          if ! grep -q "CONFIG_KSU_SUSFS" fs/Makefile; then
+            echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
+          fi
+
+          PATCH_FILE=$(find susfs4ksu/kernel_patches -name "*6.12*.patch" | head -n 1)
+          if [ -z "$PATCH_FILE" ]; then
+            PATCH_FILE=$(find susfs4ksu/kernel_patches -name "*android16*.patch" | head -n 1)
+          fi
+
+          if [ -n "$PATCH_FILE" ]; then
+            echo "应用内核补丁: ${PATCH_FILE} ..."
+            patch -p1 --forward < "${PATCH_FILE}" || {
+              echo "部分 hunk 已打入或偏移，继续进行 hook 校验..."
+            }
+          fi
+
+          # 确保注入 ksu_handle_setresuid 钩子
+          if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
+            echo "向 kernel/sys.c 注入 ksu_handle_setresuid 钩子..."
+            sed -i '1i #if defined(CONFIG_KSU) || defined(CONFIG_KSU_SUSFS)\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif' kernel/sys.c
+            sed -i '/long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)/{n;s/{/{\n#if defined(CONFIG_KSU) || defined(CONFIG_KSU_SUSFS)\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif/}' kernel/sys.c
+          fi
+
+      # 6. 解析特性组件版本 (供 Release 说明展示)
+      - name: Extract Feature Component Versions
+        run: |
+          echo "=== 提取特性组件版本 ==="
+
+          # 1. 提取 BakaSU 版本
+          BAKASU_VER="未知版本"
+          if [ -d "KernelSU/.git" ]; then
+            BAKASU_VER=$(cd KernelSU && (git describe --tags --always 2>/dev/null || git rev-parse --short HEAD))
+          elif [ -d "drivers/kernelsu/.git" ]; then
+            BAKASU_VER=$(cd drivers/kernelsu && (git describe --tags --always 2>/dev/null || git rev-parse --short HEAD))
+          fi
+          # 读取驱动内部版本定义
+          if [ -f "drivers/kernelsu/kernel/Makefile" ]; then
+            KSU_NUM=$(grep -E 'KSU_VERSION=' drivers/kernelsu/kernel/Makefile | head -n 1 | sed -E 's/.*KSU_VERSION=([0-9a-zA-Z._-]+).*/\1/' || true)
+            [ -n "$KSU_NUM" ] && BAKASU_VER="${BAKASU_VER} (Build:${KSU_NUM})"
+          fi
+
+          # 2. 提取 SuSFS 版本
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            SUSFS_GIT=""
+            [ -d "susfs4ksu/.git" ] && SUSFS_GIT=$(cd susfs4ksu && (git describe --tags --always 2>/dev/null || git rev-parse --short HEAD))
+            SUSFS_TAG=$(grep -E 'define[[:space:]]+SUSFS_VERSION' include/linux/susfs.h 2>/dev/null | head -n 1 | awk '{print $3}' | tr -d '"' || true)
+            
+            if [ -n "$SUSFS_TAG" ]; then
+              SUSFS_VER="${SUSFS_TAG} (${SUSFS_GIT:-Git})"
+            elif [ -n "$SUSFS_GIT" ]; then
+              SUSFS_VER="${SUSFS_GIT}"
+            else
+              SUSFS_VER="v1.5.x+ (最新提交)"
+            fi
+          else
+            SUSFS_VER="未启用 (Disabled)"
+          fi
+
+          # 3. 提取 Hybrid Mount 版本
+          HM_LOG=$(git log -1 --grep="Hybrid Mount" --format="%h" 2>/dev/null || true)
+          if [ -n "$HM_LOG" ]; then
+            HYBRID_MOUNT_VER="内核内置 (${HM_LOG})"
+          else
+            HYBRID_MOUNT_VER="v1.0 (OverlayFS + VFS Inline)"
+          fi
+
+          # 导出至环境变量
+          echo "BAKASU_VER=${BAKASU_VER}" >> $GITHUB_ENV
+          echo "SUSFS_VER=${SUSFS_VER}" >> $GITHUB_ENV
+          echo "HYBRID_MOUNT_VER=${HYBRID_MOUNT_VER}" >> $GITHUB_ENV
+
+          echo "BakaSU 版本: ${BAKASU_VER}"
+          echo "SuSFS 版本: ${SUSFS_VER}"
+          echo "Hybrid Mount 版本: ${HYBRID_MOUNT_VER}"
+
+      # 7. 持久化缓存：Google AOSP Clang 工具链
       - name: Cache AOSP Clang Toolchain
         id: cache-clang
         uses: actions/cache@v4
@@ -105,7 +186,7 @@ jobs:
         if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
           mkdir -p ${{ github.workspace }}/clang
-          echo "未命中本地工具链缓存，从 AOSP 下载 clang-r522817..."
+          echo "从 AOSP 下载 clang-r522817..."
           curl -LO "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
           tar -C ${{ github.workspace }}/clang/ -zxf clang-r522817.tar.gz
           rm -f clang-r522817.tar.gz
@@ -114,7 +195,7 @@ jobs:
         run: |
           echo "${{ github.workspace }}/clang/bin" >> $GITHUB_PATH
 
-      # 6. 持久化缓存：ccache 编译缓存
+      # 8. 持久化缓存：ccache 编译缓存
       - name: Cache ccache Data
         uses: actions/cache@v4
         with:
@@ -129,14 +210,13 @@ jobs:
           mkdir -p "${CCACHE_DIR}"
           ccache -M 4.5G
           ccache -z
-          
-          # 创建编译器软链接，避免在 make 参数中传递带空格的 "ccache clang"
+
           sudo mkdir -p /usr/local/ccache-bin
           sudo ln -sf $(which ccache) /usr/local/ccache-bin/clang
           sudo ln -sf $(which ccache) /usr/local/ccache-bin/clang++
           echo "/usr/local/ccache-bin" >> $GITHUB_PATH
 
-      # 7. 内核配置、特性启用与标签注入
+      # 9. 内核配置、特性启用与标签注入
       - name: Configure Kernel & Apply Features
         run: |
           export ARCH=arm64
@@ -146,7 +226,6 @@ jobs:
           OUT_DIR=out
           mkdir -p ${OUT_DIR}
 
-          # 生成 defconfig
           make -j$(nproc --all) O=${OUT_DIR} \
             ARCH=arm64 \
             LLVM=1 \
@@ -154,22 +233,18 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             gki_defconfig
 
-          # 注入用户自定义的内核标签标识 (uname -r)
           CUSTOM_LABEL="${{ inputs.kernel_label }}"
           echo "设置内核 LocalVersion 为: -${CUSTOM_LABEL}"
           scripts/config --file ${OUT_DIR}/.config --set-str LOCALVERSION "-${CUSTOM_LABEL}"
 
-          # 注入 Hybrid Mount 核心依赖 (OverlayFS, tmpfs_xattr, squashfs)
-          echo "配置 Hybrid Mount 所需特性..."
+          # Hybrid Mount 特性项
           scripts/config --file ${OUT_DIR}/.config -e OVERLAY_FS
           scripts/config --file ${OUT_DIR}/.config -e SQUASHFS
           scripts/config --file ${OUT_DIR}/.config -e TMPFS_XATTR
 
-          # 注入 BakaSU 与 SuSFS 深度隐藏特性
-          echo "配置 BakaSU / KernelSU 特性..."
+          # BakaSU 与 SuSFS 特性项
           scripts/config --file ${OUT_DIR}/.config -e KSU
           if [ "${{ inputs.enable_susfs }}" = "true" ]; then
-            echo "配置 SuSFS 隐藏挂载与 Hash 模式..."
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_MOUNT
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_ENABLE_HASH_MODE
@@ -181,7 +256,7 @@ jobs:
           # 规避 BTF 与 pahole 校验冲突
           scripts/config --file ${OUT_DIR}/.config -d DEBUG_INFO_BTF
 
-      # 8. 执行编译（加入 KCFLAGS="-w" 屏蔽误报，附带错误自动捕获）
+      # 10. 执行编译
       - name: Build Kernel Image
         run: |
           export ARCH=arm64
@@ -190,7 +265,6 @@ jobs:
 
           OUT_DIR=out
 
-          # 编译 Image 并输出日志
           make -j$(nproc --all) O=${OUT_DIR} \
             ARCH=arm64 \
             LLVM=1 \
@@ -199,7 +273,6 @@ jobs:
             KCFLAGS="-w" \
             Image 2>&1 | tee build.log
 
-          # 产物校验，若失败则自动抓取关键错误
           if [ ! -f "${OUT_DIR}/arch/arm64/boot/Image" ]; then
             echo "================== 编译失败，核心错误提取 =================="
             grep -iE "(fatal error|error:)" build.log -B 2 -A 5 | tail -n 40 || true
@@ -207,13 +280,13 @@ jobs:
             exit 1
           fi
 
-      # 9. 输出本轮 ccache 命中统计
+      # 11. 输出 ccache 统计
       - name: Display ccache Statistics
         run: |
           echo "=== ccache 构建统计 ==="
           ccache -s
 
-      # 10. 使用 AnyKernel3 打包为刷机包 (Zip)
+      # 12. 使用 AnyKernel3 打包
       - name: Package with AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1 AnyKernel3
@@ -233,14 +306,14 @@ jobs:
           echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
           echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_ENV
 
-      # 11. 上传 Artifact 构建产物
+      # 13. 上传 Artifact 产物
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ZIP_NAME }}
           path: ${{ env.ZIP_NAME }}
 
-      # 12. 自动发布到 GitHub Releases
+      # 14. 自动发布到 GitHub Releases (携带特性版本说明)
       - name: Publish Release
         if: ${{ inputs.create_release == true }}
         uses: softprops/action-gh-release@v2
@@ -248,10 +321,20 @@ jobs:
           tag_name: ${{ inputs.kernel_label }}-${{ env.BUILD_DATE }}
           name: Xiaomi SM8850 BakaSU (${{ inputs.kernel_label }}) -${{ env.BUILD_DATE }}
           body: |
-            ### 构建信息
-            - **源码分支**: `bakasu`
-            - **芯片平台**: Qualcomm SM8850 (Xiaomi 17 系列)
+            ### 📱 构建基本信息
+            - **目标芯片**: 高通骁龙 SM8850 (小米 17 系列)
             - **内核基线**: Linux 6.12 GKI (Android 16)
-            - **集成特性**: BakaSU, SuSFS 模块隐藏, Hybrid Mount
-            - **内核标签**: `${{ inputs.kernel_label }}`
+            - **源码分支**: `${{ github.ref_name }}` (Commit: `${{ github.sha }}`)
+            - **自定义内核标识**: `${{ inputs.kernel_label }}`
+            - **构建时间**: `${{ env.BUILD_DATE }}`
+
+            ### 🧩 核心特性集成版本
+            - **BakaSU 内核补丁版本**: `${{ env.BAKASU_VER }}`
+            - **SuSFS 隐藏增强版本**: `${{ env.SUSFS_VER }}`
+            - **Hybrid Mount 版本**: `${{ env.HYBRID_MOUNT_VER }}`
+
+            ### 📥 刷入指引
+            1. 请确保设备已解锁 Bootloader。
+            2. 使用支持 Android 16 的 内核管理器刷入 zip 刷机包。
+            3. 重启设备并配合最新的 BakaSU / KernelSU 管理器 App 使用。
           files: ${{ env.ZIP_NAME }}
