@@ -108,10 +108,28 @@ jobs:
       contents: write
 
     steps:
+      # 0. 安全初始化环境变量（彻底杜绝表达式错误）
+      - name: Initialize Workflow Environment
+        run: |
+          LABEL="${{ inputs.kernel_label }}"
+          [ -z "$LABEL" ] && LABEL="Kokuban-SilverWolf"
+          echo "KERNEL_LABEL=${LABEL}" >> $GITHUB_ENV
+
+          ENABLE_SUSFS="${{ inputs.enable_susfs }}"
+          [ "$ENABLE_SUSFS" != "false" ] && ENABLE_SUSFS="true"
+          echo "ENABLE_SUSFS=${ENABLE_SUSFS}" >> $GITHUB_ENV
+
+          CREATE_REL="${{ inputs.create_release }}"
+          [ "$CREATE_REL" != "false" ] && CREATE_REL="true"
+          echo "CREATE_RELEASE=${CREATE_REL}" >> $GITHUB_ENV
+
+          echo "=== 构建参数初始化完成 ==="
+          echo "内核标识: ${LABEL}"
+          echo "启用 SuSFS: ${ENABLE_SUSFS}"
+          echo "发布 Release: ${CREATE_REL}"
+
       - name: Display Build Reason
         run: |
-          echo "=== 触发本次编译的原因 ==="
-          echo "${{ needs.check.outputs.build_reason }}"
 
       # 2. 检出源码
       - name: Checkout Source (bakasu branch)
@@ -164,9 +182,9 @@ jobs:
             exit 1
           fi
 
-      # 5. 集成 SuSFS 内核端代码与补丁 (使用纯 printf 彻底消除 YAML 语法红线)
+      # 5. 集成 SuSFS 内核端代码与补丁
       - name: Setup & Patch SuSFS Kernel Side
-        if: ${{ inputs.enable_susfs != false }}
+        if: env.ENABLE_SUSFS == 'true'
         run: |
           echo "=== 集成 SuSFS 内核端代码与补丁 ==="
           rm -rf susfs4ksu
@@ -196,7 +214,6 @@ jobs:
             }
           fi
 
-          # 自动补全缺失的 #include <linux/susfs.h>
           for target in fs/exec.c fs/open.c fs/stat.c fs/namei.c fs/namespace.c fs/proc_namespace.c; do
             if [ -f "$target" ]; then
               if grep -q "susfs_" "$target" && ! grep -q "linux/susfs.h" "$target"; then
@@ -206,19 +223,16 @@ jobs:
             fi
           done
 
-          # 在 include/linux/susfs.h 声明函数原型
           if ! grep -q "susfs_is_current_proc_no_su" include/linux/susfs.h; then
             echo "在 include/linux/susfs.h 中补充声明..."
             printf '\n#if defined(CONFIG_KSU_SUSFS)\nextern bool susfs_is_current_proc_no_su(void);\n#endif\n' >> include/linux/susfs.h
           fi
 
-          # 使用 printf 单行追加函数体，避免 Heredoc 导致的缩进错误
           if ! grep -q "susfs_is_current_proc_no_su" fs/susfs.c; then
             echo "在 fs/susfs.c 中补充默认函数实现..."
             printf '\nbool susfs_is_current_proc_no_su(void) {\n    return false;\n}\n' >> fs/susfs.c
           fi
 
-          # 向 kernel/sys.c 注入 ksu_handle_setresuid 钩子
           if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
             echo "向 kernel/sys.c 注入 ksu_handle_setresuid 钩子..."
             sed -i '1i #if defined(CONFIG_KSU) || defined(CONFIG_KSU_SUSFS)\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif' kernel/sys.c
@@ -241,7 +255,7 @@ jobs:
             [ -n "$KSU_NUM" ] && BAKASU_VER="${BAKASU_VER} (Build:${KSU_NUM})"
           fi
 
-          if [ "${{ inputs.enable_susfs != false }}" = "true" ]; then
+          if [ "$ENABLE_SUSFS" = "true" ]; then
             SUSFS_GIT=""
             [ -d "susfs4ksu/.git" ] && SUSFS_GIT=$(cd susfs4ksu && (git describe --tags --always 2>/dev/null || git rev-parse --short HEAD))
             SUSFS_TAG=$(grep -E 'define[[:space:]]+SUSFS_VERSION' include/linux/susfs.h 2>/dev/null | head -n 1 | awk '{print $3}' | tr -d '"' || true)
@@ -334,16 +348,15 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             gki_defconfig
 
-          CUSTOM_LABEL="${{ inputs.kernel_label || 'Kokuban-SilverWolf' }}"
-          echo "设置内核 LocalVersion 为: -${CUSTOM_LABEL}"
-          scripts/config --file ${OUT_DIR}/.config --set-str LOCALVERSION "-${CUSTOM_LABEL}"
+          echo "设置内核 LocalVersion 为: -${KERNEL_LABEL}"
+          scripts/config --file ${OUT_DIR}/.config --set-str LOCALVERSION "-${KERNEL_LABEL}"
 
           scripts/config --file ${OUT_DIR}/.config -e OVERLAY_FS
           scripts/config --file ${OUT_DIR}/.config -e SQUASHFS
           scripts/config --file ${OUT_DIR}/.config -e TMPFS_XATTR
 
           scripts/config --file ${OUT_DIR}/.config -e KSU
-          if [ "${{ inputs.enable_susfs != false }}" = "true" ]; then
+          if [ "$ENABLE_SUSFS" = "true" ]; then
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_MOUNT
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_ENABLE_HASH_MODE
@@ -394,8 +407,7 @@ jobs:
           cp out/arch/arm64/boot/Image AnyKernel3/Image
 
           BUILD_DATE=$(date +%Y%m%d_%H%M%S)
-          CUSTOM_LABEL="${{ inputs.kernel_label || 'Kokuban-SilverWolf' }}"
-          ZIP_NAME="Kernel-SM8850-${CUSTOM_LABEL}-${BUILD_DATE}.zip"
+          ZIP_NAME="Kernel-SM8850-${KERNEL_LABEL}-${BUILD_DATE}.zip"
 
           cd AnyKernel3
           zip -r9 "../${ZIP_NAME}" * -x .git README.md *placeholder
@@ -413,17 +425,17 @@ jobs:
 
       # 14. 自动发布到 GitHub Releases
       - name: Publish Release
-        if: ${{ inputs.create_release != false }}
+        if: env.CREATE_RELEASE == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.kernel_label \vert{}\vert{} 'Kokuban-SilverWolf' }}-${{ env.BUILD_DATE }}
-          name: Xiaomi SM8850 BakaSU (${{ inputs.kernel_label \vert{}\vert{} 'Kokuban-SilverWolf' }}) -${{ env.BUILD_DATE }}
+          tag_name: ${{ env.KERNEL_LABEL }}-${{ env.BUILD_DATE }}
+          name: Xiaomi SM8850 BakaSU (${{ env.KERNEL_LABEL }}) -${{ env.BUILD_DATE }}
           body: |
             ### 📱 构建基本信息
             - **目标芯片**: 高通骁龙 SM8850 (小米 17 系列)
             - **内核基线**: Linux 6.12 GKI (Android 16)
             - **触发来源**: `${{ needs.check.outputs.build_reason }}`
-            - **自定义内核标识**: `${{ inputs.kernel_label || 'Kokuban-SilverWolf' }}`
+            - **自定义内核标识**: `${{ env.KERNEL_LABEL }}`
             - **构建时间**: `${{ env.BUILD_DATE }}`
 
             ### 🧩 核心特性集成版本
