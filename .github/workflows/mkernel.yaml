@@ -7,7 +7,7 @@ on:
         description: '内核标识 (自定义 uname -r 后缀与 Zip 命名)'
         required: true
         type: string
-        default: 'Kokuban-SilverWolf'
+        default: 'ONIONFISHSELFUSE'
       enable_susfs:
         description: '启用 SuSFS 深度隐藏特性'
         required: true
