@@ -7,7 +7,7 @@ on:
         description: '内核标识 (自定义 uname -r 后缀与 Zip 命名)'
         required: true
         type: string
-        default: 'Kokuban-SilverWolf'
+        default: 'ONIONFISH2'
       enable_susfs:
         description: '启用 SuSFS 深度隐藏特性'
         required: true
@@ -108,7 +108,7 @@ jobs:
       contents: write
 
     steps:
-      # 0. 初始化并校验构建环境变量
+      # 0. 安全初始化环境变量
       - name: Initialize Workflow Environment
         run: |
           LABEL="${{ inputs.kernel_label }}"
@@ -194,7 +194,7 @@ jobs:
             exit 1
           fi
 
-      # 5. 集成 SuSFS 内核端代码与补丁 (修复 current_uid 及头文件顺序)
+      # 5. 集成 SuSFS 内核端代码与深度修复补丁
       - name: Setup & Patch SuSFS Kernel Side
         if: env.ENABLE_SUSFS == 'true'
         run: |
@@ -226,15 +226,23 @@ jobs:
             }
           fi
 
-          # 1. 确保 include/linux/susfs_def.h 包含 linux/cred.h (彻底解决 current_uid 未定义)
+          # 1. 确保 include/linux/susfs_def.h 包含 cred.h (解决 current_uid 未定义)
           if [ -f "include/linux/susfs_def.h" ]; then
             if ! grep -q "linux/cred.h" include/linux/susfs_def.h; then
-              echo "为 include/linux/susfs_def.h 补全 #include <linux/cred.h>..."
+              echo "为 include/linux/susfs_def.h 补充 #include <linux/cred.h>..."
               sed -i '1i #include <linux/cred.h>' include/linux/susfs_def.h
             fi
           fi
 
-          # 2. 精准定位目标文件的【最后一个 #include 之后】追加头文件，严禁插入在第一行
+          # 2. 确保 include/linux/susfs.h 无条件声明 susfs_is_current_proc_no_su
+          if [ -f "include/linux/susfs.h" ]; then
+            if ! grep -q "extern bool susfs_is_current_proc_no_su" include/linux/susfs.h; then
+              echo "在 include/linux/susfs.h 中显式声明 susfs_is_current_proc_no_su 原型..."
+              printf '\nextern bool susfs_is_current_proc_no_su(void);\n' >> include/linux/susfs.h
+            fi
+          fi
+
+          # 3. 针对 fs/exec.c 等 VFS 核心文件规范注入头文件与原型
           python3 -c '
           import os
 
@@ -243,35 +251,39 @@ jobs:
               if not os.path.exists(target):
                   continue
               with open(target, "r") as f:
-                  content = f.read()
-              if "susfs_" in content and "linux/susfs.h" not in content:
-                  print(f"正在为 {target} 规范追加 #include <linux/susfs.h>...")
-                  lines = content.splitlines(keepends=True)
-                  last_inc = -1
-                  for i, line in enumerate(lines):
-                      if line.strip().startswith("#include"):
-                          last_inc = i
-                  inject = "#if defined(CONFIG_KSU_SUSFS)\n#include <linux/susfs.h>\n#endif\n"
-                  if last_inc != -1:
-                      lines.insert(last_inc + 1, inject)
-                  else:
-                      lines.insert(0, inject)
-                  with open(target, "w") as f:
-                      f.writelines(lines)
+                  lines = f.readlines()
+
+              # 寻找最后一个 #include 所在行号
+              last_inc = -1
+              for i, line in enumerate(lines):
+                  if line.strip().startswith("#include"):
+                      last_inc = i
+
+              inject = "\n#if defined(CONFIG_KSU_SUSFS) || defined(CONFIG_KSU_SUSFS_SUS_SU)\n#include <linux/susfs.h>\nextern bool susfs_is_current_proc_no_su(void);\n#endif\n"
+
+              if target == "fs/exec.c":
+                  # 针对 fs/exec.c 无条件在最后一个 include 之后注入
+                  if "extern bool susfs_is_current_proc_no_su" not in "".join(lines):
+                      lines.insert(last_inc + 1 if last_inc != -1 else 0, inject)
+                      with open(target, "w") as f:
+                          f.writelines(lines)
+                      print("已在 fs/exec.c 注入 susfs.h 与符号原型")
+              else:
+                  content = "".join(lines)
+                  if "susfs_" in content and "linux/susfs.h" not in content:
+                      lines.insert(last_inc + 1 if last_inc != -1 else 0, inject)
+                      with open(target, "w") as f:
+                          f.writelines(lines)
+                      print(f"已为 {target} 规范追加 susfs 头文件")
           '
 
-          # 3. 补充 susfs_is_current_proc_no_su 原型与函数体
-          if ! grep -q "susfs_is_current_proc_no_su" include/linux/susfs.h; then
-            echo "在 include/linux/susfs.h 中补充声明..."
-            printf '\n#if defined(CONFIG_KSU_SUSFS)\nextern bool susfs_is_current_proc_no_su(void);\n#endif\n' >> include/linux/susfs.h
+          # 4. 在 fs/susfs.c 追加弱符号实现 (无论是否开宏，绝对不报 undefined reference)
+          if [ -f "fs/susfs.c" ]; then
+            printf '\n__attribute__((weak)) bool susfs_is_current_proc_no_su(void) {\n    return false;\n}\n' >> fs/susfs.c
+            echo "已向 fs/susfs.c 注入弱符号保底实现"
           fi
 
-          if ! grep -q "susfs_is_current_proc_no_su" fs/susfs.c; then
-            echo "在 fs/susfs.c 中补充默认函数实现..."
-            printf '\nbool susfs_is_current_proc_no_su(void) {\n    return false;\n}\n' >> fs/susfs.c
-          fi
-
-          # 4. 注入 ksu_handle_setresuid 钩子
+          # 5. 注入 ksu_handle_setresuid 钩子
           if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
             echo "向 kernel/sys.c 注入 ksu_handle_setresuid 钩子..."
             sed -i '1i #if defined(CONFIG_KSU) || defined(CONFIG_KSU_SUSFS)\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif' kernel/sys.c
@@ -349,9 +361,9 @@ jobs:
         run: |
           echo "${{ github.workspace }}/clang/bin" >> $GITHUB_PATH
 
-      # 8. 持久化缓存：ccache
-      - name: Cache ccache Data
-        uses: actions/cache@v4
+      # 8. 恢复 ccache 历史编译缓存
+      - name: Restore ccache Data
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_DIR }}
           key: kernel-ccache-${{ runner.os }}-sm8850-${{ github.ref_name }}-${{ github.sha }}
@@ -370,7 +382,7 @@ jobs:
           sudo ln -sf $(which ccache) /usr/local/ccache-bin/clang++
           echo "/usr/local/ccache-bin" >> $GITHUB_PATH
 
-      # 9. 内核配置与特性注入
+      # 9. 内核配置与全套特性注入 (注入 SuSFS 完整特性宏)
       - name: Configure Kernel & Apply Features
         run: |
           export ARCH=arm64
@@ -390,18 +402,30 @@ jobs:
           echo "设置内核 LocalVersion 为: -${KERNEL_LABEL}"
           scripts/config --file ${OUT_DIR}/.config --set-str LOCALVERSION "-${KERNEL_LABEL}"
 
+          # Hybrid Mount 特性项
           scripts/config --file ${OUT_DIR}/.config -e OVERLAY_FS
           scripts/config --file ${OUT_DIR}/.config -e SQUASHFS
           scripts/config --file ${OUT_DIR}/.config -e TMPFS_XATTR
 
+          # BakaSU 基础项
           scripts/config --file ${OUT_DIR}/.config -e KSU
+
+          # SuSFS 完整特性项激活 (关键修复: 激活 KSU_SUSFS_SUS_SU)
           if [ "$ENABLE_SUSFS" = "true" ]; then
+            echo "正在激活 SuSFS 完整功能链配置..."
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_MOUNT
-            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_ENABLE_HASH_MODE
-            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_SU
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_KSTAT
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_OVERLAYFS
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_TRY_UMOUNT
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_ENABLE_HASH_MODE
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SPOOF_UNAME
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+            scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_OPEN_REDIRECT
           fi
 
           scripts/config --file ${OUT_DIR}/.config -d DEBUG_INFO_BTF
@@ -430,13 +454,21 @@ jobs:
             exit 1
           fi
 
-      # 11. 输出 ccache 统计
+      # 11. 即使失败也强制保存本次 ccache 编译缓存增量 (大幅缩减后续重编译耗时)
+      - name: Save ccache Data Even on Failure
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: kernel-ccache-${{ runner.os }}-sm8850-${{ github.ref_name }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # 12. 输出 ccache 统计
       - name: Display ccache Statistics
         run: |
           echo "=== ccache 构建统计 ==="
           ccache -s
 
-      # 12. 使用 AnyKernel3 打包
+      # 13. 使用 AnyKernel3 打包
       - name: Package with AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1 AnyKernel3
@@ -455,14 +487,14 @@ jobs:
           echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
           echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_ENV
 
-      # 13. 上传 Artifact 产物
+      # 14. 上传 Artifact 产物
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ZIP_NAME }}
           path: ${{ env.ZIP_NAME }}
 
-      # 14. 自动发布到 GitHub Releases
+      # 15. 自动发布到 GitHub Releases
       - name: Publish Release
         if: env.CREATE_RELEASE == 'true'
         uses: softprops/action-gh-release@v2
