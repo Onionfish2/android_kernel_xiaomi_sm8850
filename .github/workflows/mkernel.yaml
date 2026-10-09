@@ -446,21 +446,23 @@ jobs:
           # 写入新编译出的内核镜像
           cp -fv out/arch/arm64/boot/Image AnyKernel3/Image
 
-          # 配置 anykernel.sh：针对小米 17 系列设备代号与 GKI v4 架构[cite: 1]
+          # 配置 anykernel.sh 设备代号与属性
           sed -i "s/kernel.string=.*/kernel.string=Xiaomi17-Kokuban-${KERNEL_LABEL}/g" AnyKernel3/anykernel.sh
-          sed -i 's/do.devicecheck=1/do.devicecheck=1/g' AnyKernel3/anykernel.sh[cite: 1]
-          sed -i 's/do.systemless=1/do.systemless=0/g' AnyKernel3/anykernel.sh[cite: 1]
-          sed -i 's/device.name1=.*/device.name1=nezha/g' AnyKernel3/anykernel.sh[cite: 1]
-          sed -i 's/device.name2=.*/device.name2=popsicle/g' AnyKernel3/anykernel.sh[cite: 1]
-          sed -i 's/device.name3=.*/device.name3=pandora/g' AnyKernel3/anykernel.sh[cite: 1]
-          sed -i 's/device.name4=.*/device.name4=pudding/g' AnyKernel3/anykernel.sh[cite: 1]
+          sed -i 's/do.devicecheck=1/do.devicecheck=1/g' AnyKernel3/anykernel.sh
+          sed -i 's/do.systemless=1/do.systemless=0/g' AnyKernel3/anykernel.sh
+          sed -i 's/device.name1=.*/device.name1=nezha/g' AnyKernel3/anykernel.sh
+          sed -i 's/device.name2=.*/device.name2=popsicle/g' AnyKernel3/anykernel.sh
+          sed -i 's/device.name3=.*/device.name3=pandora/g' AnyKernel3/anykernel.sh
+          sed -i 's/device.name4=.*/device.name4=pudding/g' AnyKernel3/anykernel.sh
 
-          sed -i 's|BLOCK=.*|BLOCK=/dev/block/by-name/boot;|g' AnyKernel3/anykernel.sh[cite: 1]
-          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=1;/g' AnyKernel3/anykernel.sh[cite: 1]
-          sed -i 's/RAMDISK_COMPRESSION=auto;/RAMDISK_COMPRESSION=auto;\nPATCH_VBMETA_FLAG=auto;/g' AnyKernel3/anykernel.sh[cite: 1]
+          # 配置 A/B 槽位与分区
+          sed -i 's|BLOCK=.*|BLOCK=/dev/block/by-name/boot;|g' AnyKernel3/anykernel.sh
+          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=1;/g' AnyKernel3/anykernel.sh
+          sed -i 's/RAMDISK_COMPRESSION=auto;/RAMDISK_COMPRESSION=auto;\nPATCH_VBMETA_FLAG=auto;/g' AnyKernel3/anykernel.sh
 
-          sed -i 's/dump_boot;/split_boot;/g' AnyKernel3/anykernel.sh[cite: 1]
-          sed -i 's/write_boot;/flash_boot;/g' AnyKernel3/anykernel.sh[cite: 1]
+          # GKI 架构必须跳过 ramdisk 解包
+          sed -i 's/dump_boot;/split_boot;/g' AnyKernel3/anykernel.sh
+          sed -i 's/write_boot;/flash_boot;/g' AnyKernel3/anykernel.sh
 
           BUILD_DATE=$(date +%Y%m%d_%H%M%S)
           ZIP_NAME="Kernel-SM8850-${KERNEL_LABEL}-${BUILD_DATE}.zip"
@@ -471,7 +473,7 @@ jobs:
 
           echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
           echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_ENV
-
+          
       # 14. 编译独立 boot.img 并处理 init_boot.img
       - name: Build boot.img & Prepare init_boot.img
         run: |
