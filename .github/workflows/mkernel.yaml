@@ -91,7 +91,7 @@ jobs:
               if [ "$DAYS_DIFF" -ge 7 ]; then
                 NEED_BUILD="true"
                 REASON="已达到 7 天定期编译周期 (距上次发布已有 ${DAYS_DIFF} 天)"
-              elif ! echo "$LAST_RELEASE_BODY" | grep -Fq "$CURRENT_HASH"; then
+              elif ! echo "$LAST_RELEASE_BODY" \vert{} grep -Fq "$CURRENT_HASH"; then
                 NEED_BUILD="true"
                 REASON="检测到上游组件变动 (BakaSU / SuSFS / 内核源码有新提交)"
               else
@@ -111,9 +111,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-
     steps:
-      # 0. 初始化并校验构建环境变量
+      # 0. 初始化构建环境变量
       - name: Initialize Workflow Environment
         run: |
           LABEL="${{ inputs.kernel_label }}"
@@ -156,7 +155,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      # 3. 安装依赖工具链 (包含 Python 与打包组件)
+      # 3. 安装依赖工具链
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
@@ -169,7 +168,7 @@ jobs:
       # 4. 配置并装载 BakaSU 驱动
       - name: Setup BakaSU / KernelSU Source
         run: |
-          echo "=== 检查并配置 BakaSU / KernelSU 驱动 ==="
+          echo "=== 配置 BakaSU 驱动 ==="
           rm -rf drivers/kernelsu KernelSU
 
           SETUP_OK=false
@@ -199,7 +198,7 @@ jobs:
             exit 1
           fi
 
-      # 5. 集成 SuSFS 内核端代码与精准修复补丁
+      # 5. 集成 SuSFS 内核端代码与规范补丁
       - name: Setup & Patch SuSFS Kernel Side
         if: env.ENABLE_SUSFS == 'true'
         run: |
@@ -225,46 +224,57 @@ jobs:
           fi
 
           if [ -n "$PATCH_FILE" ]; then
-            echo "应用内核补丁: ${PATCH_FILE} ..."
+            echo "尝试应用内核补丁: ${PATCH_FILE} ..."
             patch -p1 --forward < "${PATCH_FILE}" || {
-              echo "部分 hunk 已打入或偏移，进入后续自动修复阶段..."
+              echo "::warning::部分 patch hunk 产生偏移或已有预置实现，跳过冲突。"
             }
           fi
 
           # 确保 susfs_def.h 引入 cred.h (解决 current_uid 未定义)
           if [ -f "include/linux/susfs_def.h" ]; then
             if ! grep -q "linux/cred.h" include/linux/susfs_def.h; then
-              echo "修复 susfs_def.h: 注入 cred.h 依赖..."
               sed -i '1i #include <linux/cred.h>' include/linux/susfs_def.h
             fi
           fi
 
-          # 规范在 fs/exec.c 引入 susfs.h (避免未声明函数报错)
-          if [ -f "fs/exec.c" ]; then
-            if ! grep -q "<linux/susfs.h>" fs/exec.c; then
-              if grep -q "<linux/binfmts.h>" fs/exec.c; then
-                sed -i '/#include <linux\/binfmts.h>/a #include <linux/susfs.h>' fs/exec.c
-              elif grep -q "<linux/sched.h>" fs/exec.c; then
-                sed -i '/#include <linux\/sched.h>/a #include <linux/susfs.h>' fs/exec.c
-              else
-                sed -i '1i #include <linux/susfs.h>' fs/exec.c
-              fi
-              echo "已成功向 fs/exec.c 注入 #include <linux/susfs.h>"
-            fi
+      # 6. 核心修复：绕过模块 CRC 校验与清除 -dirty 标记 (解决 Exec format error)
+      - name: Bypass Module CRC & Sanitize Kernel Version
+        run: |
+          echo "=== 绕过模块 CRC 检查，解决高通 vendor 驱动 Exec format error ==="
+          python3 -c "
+          import re, os
+          target_files = ['kernel/module/main.c', 'kernel/module.c']
+          patched = False
+          for path in target_files:
+              if os.path.exists(path):
+                  with open(path, 'r', encoding='utf-8') as f:
+                      content = f.read()
+                  new_content = re.sub(
+                      r'(static\s+int\s+check_version\s*\([^)]*\)\s*\{)',
+                      r'\1\n\treturn 1;',
+                      content,
+                      flags=re.DOTALL
+                  )
+                  if new_content != content:
+                      with open(path, 'w', encoding='utf-8') as f:
+                          f.write(new_content)
+                      print(f'成功在 {path} 中注入 check_version 免校验补丁！')
+                      patched = True
+                      break
+          if not patched:
+              print('提示: 未找到符合匹配的 check_version 或已完成注入')
+          "
+
+          echo "=== 清除内核版本中的 -dirty 标识 ==="
+          if [ -f "scripts/setlocalversion" ]; then
+            sed -i 's/echo "+dirty"/echo ""/g' scripts/setlocalversion
+            sed -i 's/echo "-dirty"/echo ""/g' scripts/setlocalversion
           fi
 
-          # 注入 ksu_handle_setresuid 钩子
-          if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
-            echo "向 kernel/sys.c 注入 ksu_handle_setresuid 钩子..."
-            sed -i '1i #if defined(CONFIG_KSU) || defined(CONFIG_KSU_SUSFS)\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif' kernel/sys.c
-            sed -i '/long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)/{n;s/{/{\n#if defined(CONFIG_KSU) || defined(CONFIG_KSU_SUSFS)\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif/}' kernel/sys.c
-          fi
-
-      # 6. 解析特性组件版本
+      # 7. 提取组件版本
       - name: Extract Feature Component Versions
         run: |
           echo "=== 提取特性组件版本 ==="
-
           BAKASU_VER="未知版本"
           if [ -d "KernelSU/.git" ]; then
             BAKASU_VER=$(cd KernelSU && (git describe --tags --always 2>/dev/null || git rev-parse --short HEAD))
@@ -280,7 +290,6 @@ jobs:
             SUSFS_GIT=""
             [ -d "susfs4ksu/.git" ] && SUSFS_GIT=$(cd susfs4ksu && (git describe --tags --always 2>/dev/null || git rev-parse --short HEAD))
             SUSFS_TAG=$(grep -E 'define[[:space:]]+SUSFS_VERSION' include/linux/susfs.h 2>/dev/null | head -n 1 | awk '{print $3}' | tr -d '"' || true)
-            
             if [ -n "$SUSFS_TAG" ]; then
               SUSFS_VER="${SUSFS_TAG} (${SUSFS_GIT:-Git})"
             elif [ -n "$SUSFS_GIT" ]; then
@@ -292,18 +301,10 @@ jobs:
             SUSFS_VER="未启用 (Disabled)"
           fi
 
-          HM_LOG=$(git log -1 --grep="Hybrid Mount" --format="%h" 2>/dev/null || true)
-          if [ -n "$HM_LOG" ]; then
-            HYBRID_MOUNT_VER="内核内置 (${HM_LOG})"
-          else
-            HYBRID_MOUNT_VER="v1.0 (OverlayFS + VFS Inline)"
-          fi
-
           echo "BAKASU_VER=${BAKASU_VER}" >> $GITHUB_ENV
           echo "SUSFS_VER=${SUSFS_VER}" >> $GITHUB_ENV
-          echo "HYBRID_MOUNT_VER=${HYBRID_MOUNT_VER}" >> $GITHUB_ENV
 
-      # 7. Clang 工具链离线恢复与即时持久化
+      # 8. Clang 工具链离线恢复与即时持久化
       - name: Restore AOSP Clang Cache
         id: cache-clang-restore
         uses: actions/cache/restore@v4
@@ -331,7 +332,7 @@ jobs:
         run: |
           echo "${{ github.workspace }}/clang/bin" >> $GITHUB_PATH
 
-      # 8. 恢复 ccache 历史编译缓存
+      # 9. 恢复 ccache 编译缓存
       - name: Restore ccache Data
         uses: actions/cache/restore@v4
         with:
@@ -352,7 +353,7 @@ jobs:
           sudo ln -sf $(which ccache) /usr/local/ccache-bin/clang++
           echo "/usr/local/ccache-bin" >> $GITHUB_PATH
 
-      # 9. 内核配置与全套特性注入 (注意：保持原生 GKI 默认版本，防止驱动魔数不匹配)
+      # 10. 内核配置与特性注入
       - name: Configure Kernel & Apply Features
         run: |
           export ARCH=arm64
@@ -369,6 +370,10 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             gki_defconfig
 
+          # 开启强制加载与符号版本管理
+          scripts/config --file ${OUT_DIR}/.config -e MODULE_FORCE_LOAD
+          scripts/config --file ${OUT_DIR}/.config -e MODVERSIONS
+
           # Hybrid Mount 特性项
           scripts/config --file ${OUT_DIR}/.config -e OVERLAY_FS
           scripts/config --file ${OUT_DIR}/.config -e SQUASHFS
@@ -377,9 +382,9 @@ jobs:
           # BakaSU 基础项
           scripts/config --file ${OUT_DIR}/.config -e KSU
 
-          # 激活完整 SuSFS 特性宏链
+          # 激活完整 SuSFS 特性宏
           if [ "$ENABLE_SUSFS" = "true" ]; then
-            echo "正在激活 SuSFS 全套功能宏..."
+            echo "正在激活 SuSFS 特性宏..."
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_MOUNT
             scripts/config --file ${OUT_DIR}/.config -e KSU_SUSFS_SUS_SU
@@ -397,7 +402,7 @@ jobs:
 
           scripts/config --file ${OUT_DIR}/.config -d DEBUG_INFO_BTF
 
-      # 10. 执行内核镜像编译
+      # 11. 执行内核镜像编译 (移除 KCFLAGS="-w"，保留必要警告与错误拦截)
       - name: Build Kernel Image
         run: |
           export ARCH=arm64
@@ -411,7 +416,6 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            KCFLAGS="-w" \
             Image 2>&1 | tee build.log
 
           if [ ! -f "${OUT_DIR}/arch/arm64/boot/Image" ]; then
@@ -421,7 +425,7 @@ jobs:
             exit 1
           fi
 
-      # 11. 即使失败也强制保存本次 ccache 缓存
+      # 12. 缓存管理
       - name: Save ccache Data Even on Failure
         if: always()
         uses: actions/cache/save@v4
@@ -429,13 +433,11 @@ jobs:
           path: ${{ env.CCACHE_DIR }}
           key: kernel-ccache-${{ runner.os }}-sm8850-${{ github.ref_name }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # 12. 输出 ccache 统计
       - name: Display ccache Statistics
         run: |
-          echo "=== ccache 构建统计 ==="
           ccache -s
 
-      # 13. 使用 AnyKernel3 针对小米 17 系列定制打包
+      # 13. AnyKernel3 打包 (恢复原生自适应分区与挂载点)
       - name: Package with AnyKernel3
         run: |
           echo "=== 准备 AnyKernel3 刷机包环境 ==="
@@ -443,10 +445,9 @@ jobs:
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1 AnyKernel3
           rm -rf AnyKernel3/.git*
 
-          # 写入新编译出的内核镜像
           cp -fv out/arch/arm64/boot/Image AnyKernel3/Image
 
-          # 配置 anykernel.sh 设备代号与属性
+          # 配置 anykernel.sh 设备代号
           sed -i "s/kernel.string=.*/kernel.string=Xiaomi17-Kokuban-${KERNEL_LABEL}/g" AnyKernel3/anykernel.sh
           sed -i 's/do.devicecheck=1/do.devicecheck=1/g' AnyKernel3/anykernel.sh
           sed -i 's/do.systemless=1/do.systemless=0/g' AnyKernel3/anykernel.sh
@@ -455,12 +456,7 @@ jobs:
           sed -i 's/device.name3=.*/device.name3=pandora/g' AnyKernel3/anykernel.sh
           sed -i 's/device.name4=.*/device.name4=pudding/g' AnyKernel3/anykernel.sh
 
-          # 配置 A/B 槽位与分区
-          sed -i 's|BLOCK=.*|BLOCK=/dev/block/by-name/boot;|g' AnyKernel3/anykernel.sh
-          sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=1;/g' AnyKernel3/anykernel.sh
-          sed -i 's/RAMDISK_COMPRESSION=auto;/RAMDISK_COMPRESSION=auto;\nPATCH_VBMETA_FLAG=auto;/g' AnyKernel3/anykernel.sh
-
-          # GKI 架构必须跳过 ramdisk 解包
+          # GKI 架构设置 (保留 block=auto 与 is_slot_device=auto，仅变更解包指令)
           sed -i 's/dump_boot;/split_boot;/g' AnyKernel3/anykernel.sh
           sed -i 's/write_boot;/flash_boot;/g' AnyKernel3/anykernel.sh
 
@@ -473,19 +469,17 @@ jobs:
 
           echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
           echo "BUILD_DATE=${BUILD_DATE}" >> $GITHUB_ENV
-          
+
       # 14. 编译独立 boot.img 并处理 init_boot.img
       - name: Build boot.img & Prepare init_boot.img
         run: |
           echo "=== 正在打包独立 GKI boot.img 与处理 init_boot.img ==="
           mkdir -p release_files
 
-          # 1. 直接从 AOSP / LineageOS 官方仓库克隆标准 mkbootimg 工具链
           rm -rf mkbootimg_tools
           git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg_tools || \
           git clone --depth=1 https://github.com/LineageOS/android_system_tools_mkbootimg.git mkbootimg_tools
 
-          # 2. 构建符合 Boot Header v4 规范的标准 GKI boot.img
           BOOT_IMG_NAME="boot-SM8850-${KERNEL_LABEL}-${BUILD_DATE}.img"
           python3 mkbootimg_tools/mkbootimg.py \
             --header_version 4 \
@@ -494,20 +488,16 @@ jobs:
             --output "release_files/${BOOT_IMG_NAME}"
           echo "已成功生成独立 boot 启动镜像: ${BOOT_IMG_NAME}"
 
-          # 3. 处理 init_boot.img (若输入了原厂下载直链，使用 -fsSL 防止保存 404 页面)
           INIT_BOOT_URL="${{ inputs.init_boot_url }}"
           if [ -n "$INIT_BOOT_URL" ]; then
             INIT_BOOT_IMG_NAME="init_boot-SM8850-${BUILD_DATE}.img"
             echo "正在从直链下载指定原厂 init_boot: ${INIT_BOOT_URL} ..."
             curl -fsSL -o "release_files/${INIT_BOOT_IMG_NAME}" "$INIT_BOOT_URL" || {
-              echo "::warning::原厂 init_boot 下载失败，请检查直链有效性！本次将跳过附带此产物。"
+              echo "::warning::原厂 init_boot 下载失败，请检查直链有效性！"
               rm -f "release_files/${INIT_BOOT_IMG_NAME}"
             }
-          else
-            echo "提示：未传入 init_boot_url 直链，跳过该项打包。"
           fi
 
-          # 4. 汇总 AnyKernel3 Zip 刷机包到发布目录
           cp -fv "${ZIP_NAME}" release_files/
 
       # 15. 上传 Artifact 构建产物
@@ -535,20 +525,10 @@ jobs:
             ### 🧩 核心特性集成版本
             - **BakaSU 内核补丁版本**: `${{ env.BAKASU_VER }}`
             - **SuSFS 隐藏增强版本**: `${{ env.SUSFS_VER }}`
-            - **Hybrid Mount 版本**: `${{ env.HYBRID_MOUNT_VER }}`
 
-            ### 📦 包含产物与刷入指引
-            1. **AnyKernel3 刷机包 (`Kernel-SM8850-*.zip`)**:
-               - 适配小米 17 系列动态分区与槽位引导[cite: 1]。
-               - 可在支持 Android 16 的 Recovery (TWRP / OrangeFox) 中直接刷入。
-            2. **独立启动镜像 (`boot-SM8850-*.img`)**:
-               - 标准 GKI Boot Header v4 格式，内嵌新编译出的 Linux 6.12 内核。
-               - 支持在 Fastboot 模式直接单刷：
-                 ```bash
-                 fastboot flash boot boot-SM8850-*.img
-                 ```
-            3. **初始化引导镜像 (`init_boot-SM8850-*.img`)**:
-               - 若手动触发构建时填入了原厂 `init_boot_url`，则会自动附带此包，方便备用与还原。
+            ### 📦 产物推荐刷入方式
+            - 推荐在 Recovery (TWRP / OrangeFox) 中刷入 `Kernel-SM8850-*.zip`，它会自动处理引导槽位与 Ramdisk 兼容。
+            - 若使用 Fastboot 刷入 `boot-SM8850-*.img`，请确保设备已正确处于对应当前 slot 槽位。
 
             <!-- TRACK_HASH: ${{ needs.check.outputs.track_hash }} -->
           files: release_files/*
