@@ -480,27 +480,31 @@ jobs:
           echo "=== 正在打包独立 GKI boot.img 与处理 init_boot.img ==="
           mkdir -p release_files
 
-          # 1. 获取 Google AOSP 官方 mkbootimg 打包脚本
-          curl -sLo mkbootimg.py https://raw.githubusercontent.com/aosp-mirror/platform_system_tools_mkbootimg/master/mkbootimg.py
+          # 1. 直接从 AOSP / LineageOS 官方仓库克隆标准 mkbootimg 工具链
+          rm -rf mkbootimg_tools
+          git clone --depth=1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbootimg_tools || \
+          git clone --depth=1 https://github.com/LineageOS/android_system_tools_mkbootimg.git mkbootimg_tools
 
           # 2. 构建符合 Boot Header v4 规范的标准 GKI boot.img
           BOOT_IMG_NAME="boot-SM8850-${KERNEL_LABEL}-${BUILD_DATE}.img"
-          python3 mkbootimg.py \
+          python3 mkbootimg_tools/mkbootimg.py \
             --header_version 4 \
             --kernel out/arch/arm64/boot/Image \
             --pagesize 4096 \
             --output "release_files/${BOOT_IMG_NAME}"
           echo "已成功生成独立 boot 启动镜像: ${BOOT_IMG_NAME}"
 
-          # 3. 处理 init_boot.img (若输入了原厂下载直链，则自动拉取打包)
+          # 3. 处理 init_boot.img (若输入了原厂下载直链，使用 -fsSL 防止保存 404 页面)
           INIT_BOOT_URL="${{ inputs.init_boot_url }}"
           if [ -n "$INIT_BOOT_URL" ]; then
             INIT_BOOT_IMG_NAME="init_boot-SM8850-${BUILD_DATE}.img"
             echo "正在从直链下载指定原厂 init_boot: ${INIT_BOOT_URL} ..."
-            curl -sLo "release_files/${INIT_BOOT_IMG_NAME}" "$INIT_BOOT_URL"
-            echo "已成功附加 init_boot 产物: ${INIT_BOOT_IMG_NAME}"
+            curl -fsSL -o "release_files/${INIT_BOOT_IMG_NAME}" "$INIT_BOOT_URL" || {
+              echo "::warning::原厂 init_boot 下载失败，请检查直链有效性！本次将跳过附带此产物。"
+              rm -f "release_files/${INIT_BOOT_IMG_NAME}"
+            }
           else
-            echo "提示：未传入 init_boot_url 直链。在 GKI 架构下，init_boot 仅存放系统原厂 ramdisk，不含内核，无需重复打包。"
+            echo "提示：未传入 init_boot_url 直链，跳过该项打包。"
           fi
 
           # 4. 汇总 AnyKernel3 Zip 刷机包到发布目录
